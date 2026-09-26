@@ -1,0 +1,136 @@
+"""
+Bot Telegram — Version finale (API Interactions + gemini-3.8-flash)
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+import asyncio
+from pathlib import Path
+from telethon import TelegramClient, events, Button
+from google import genai
+
+API_ID = 35908095
+API_HASH = "0debe3731bd74cae473d9108135ae89d"
+BOT_TOKEN = "8667760993:AAEu-ea4DB2tsOu6Bzu2sy-6wiQKOOGHXLM"
+
+# ⬇️⬇️⬇️ COLLEZ VOTRE CLÉ API ICI ⬇️⬇️⬇️
+GEMINI_API_KEY = "AQ.Ab8RN6J1fumXn2TbYHSjcfaQE6gFWJ6qx34YKAwxvLK9F5NP2A"
+# ⬆️⬆️⬆️ COLLEZ VOTRE CLÉ API ICI ⬆️⬆️⬆️
+
+GEMINI_MODEL = "gemini-3.8-flash"
+
+client_genai = genai.Client(api_key=GEMINI_API_KEY)
+
+WORK_DIR = Path("work")
+WORK_DIR.mkdir(exist_ok=True)
+
+# Session v12 pour forcer une connexion propre
+SESSION_NAME = "bot_session_v12"
+client = TelegramClient(
+    SESSION_NAME, API_ID, API_HASH, 
+    connection_retries=15, 
+    retry_delay=5, 
+    timeout=60,
+    use_ipv6=False
+)
+
+user_language: dict[int, str] = {}
+
+def get_reply_keyboard():
+    return [
+        [Button.text("🇫🇷 Français"), Button.text("🇬🇧 English")]
+    ]
+
+@client.on(events.NewMessage(pattern="/start"))
+async def start(event):
+    await event.respond(
+        "🎬 **Bot actif !** Choisis ta langue ci-dessous :",
+        buttons=get_reply_keyboard()
+    )
+
+@client.on(events.NewMessage(pattern="🇫🇷 Français"))
+async def set_fr(event):
+    user_language[event.sender_id] = "fr"
+    await event.respond("🇫🇷 Langue : **Français**. Envoie ta vidéo maintenant !")
+
+@client.on(events.NewMessage(pattern="🇬🇧 English"))
+async def set_en(event):
+    user_language[event.sender_id] = "en"
+    await event.respond("🇬🇧 Language: **English**. Send your video now!")
+
+@client.on(events.NewMessage)
+async def on_message(event):
+    # Diagnostic : on affiche TOUT message reçu
+    print(f"📩 Message reçu ! Media: {bool(event.media)} | Texte: {event.text}", flush=True)
+    
+    if not event.media or (event.text and event.text.startswith("/")):
+        return
+
+    lang = user_language.get(event.sender_id, "fr")
+    
+    print("🟢 Média détecté, envoi de l'accusé de réception...", flush=True)
+    status = await event.respond("📥 **Vidéo reçue !** Téléchargement en cours...")
+    
+    video_path = None
+
+    try:
+        print("⏳ Téléchargement de la vidéo...", flush=True)
+        video_path = await event.download_media(file=str(WORK_DIR))
+        
+        if not video_path:
+            raise Exception("Le téléchargement a échoué.")
+            
+        print(f"✅ Téléchargement réussi : {video_path}", flush=True)
+        await status.edit("⚡ **Envoi à Gemini...** (Patientez)")
+
+        # Upload avec la nouvelle API
+        video_file = await asyncio.to_thread(client_genai.files.upload, file=video_path)
+        print(f"📤 Fichier envoyé à Gemini : {video_file.name}", flush=True)
+
+        await status.edit("🧠 **Analyse en cours...**")
+        while video_file.state.name != "ACTIVE":
+            await asyncio.sleep(3)
+            video_file = await asyncio.to_thread(client_genai.files.get, name=video_file.name)
+            print(f"   État : {video_file.state.name}", flush=True)
+
+        if video_file.state.name == "FAILED":
+            raise Exception("Échec du traitement de la vidéo par Gemini.")
+
+        print("🎵 Analyse terminée, génération de la traduction...", flush=True)
+        prompt = f"Écoute l'audio de cette vidéo, transcris-le et traduis tout le contenu en {'français' if lang == 'fr' else 'anglais'}. Donne-moi le résultat propre sous forme de texte."
+
+        # Utilisation de l'API Interactions (recommandée par Google)
+        interaction = await asyncio.to_thread(
+            client_genai.interactions.create,
+            model=GEMINI_MODEL,
+            input=[
+                {"type": "video", "uri": video_file.uri, "mime_type": video_file.mime_type},
+                {"type": "text", "text": prompt}
+            ]
+        )
+
+        translated_text = interaction.output_text
+
+        await status.edit(f"✅ **Résultat de la traduction :**\n\n{translated_text}")
+        print("🎉 Terminé avec succès !", flush=True)
+
+        await asyncio.to_thread(client_genai.files.delete, name=video_file.name)
+
+    except Exception as exc:
+        print(f"❌ ERREUR : {exc}", flush=True)
+        await status.edit(f"❌ Une erreur est survenue :\n`{exc}`")
+        
+    finally:
+        if video_path and Path(video_path).exists():
+            Path(video_path).unlink(missing_ok=True)
+
+if __name__ == "__main__":
+    print("🚀 Démarrage du bot...", flush=True)
+    try:
+        client.start(bot_token=BOT_TOKEN)
+        print("✅ Connecté à Telegram ! En attente de vidéos...", flush=True)
+        client.run_until_disconnected()
+    except Exception as e:
+        print(f"\n❌ ERREUR RÉSEAU : {e}", flush=True)
